@@ -247,6 +247,7 @@ async def get_request(
     ramp_up_strategy: Literal["linear", "exponential"] | None = None,
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
+    self_timed: bool = False,
 ) -> AsyncGenerator[tuple[SampleRequest, float], None]:
     """
     Asynchronously generates requests at a specified rate
@@ -282,6 +283,48 @@ async def get_request(
 
     total_requests = len(input_requests)
     assert total_requests > 0, "No requests provided."
+
+    if self_timed:
+        if ramp_up_strategy is not None:
+            raise ValueError("--self-timed cannot be used with ramp-up traffic.")
+
+        delay_ts = []
+        previous_arrival_time = None
+        for request_index, request in enumerate(input_requests):
+            if request.arrival_time is None:
+                raise ValueError(
+                    "--self-timed requires every sample request to have an "
+                    "arrival_time. Use a dataset that provides timestamps, "
+                    "such as timed_trace."
+                )
+
+            arrival_time = float(request.arrival_time)
+            if arrival_time < 0:
+                raise ValueError(
+                    f"Request {request_index} has a negative arrival time: "
+                    f"{arrival_time}."
+                )
+            if (
+                previous_arrival_time is not None
+                and arrival_time < previous_arrival_time
+            ):
+                raise ValueError(
+                    f"Request {request_index} arrival time is not "
+                    f"non-decreasing: previous={previous_arrival_time}, "
+                    f"current={arrival_time}."
+                )
+            delay_ts.append(arrival_time)
+            previous_arrival_time = arrival_time
+
+        start_ts = time.time()
+        for request_index, request in enumerate(input_requests):
+            if delay_ts[request_index] > 0:
+                current_ts = time.time()
+                sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
+                if sleep_interval_s > 0:
+                    await asyncio.sleep(sleep_interval_s)
+            yield request, float("inf")
+        return
 
     # Precompute delays among requests to minimize request send laggings
     request_rates = []
@@ -628,6 +671,7 @@ async def benchmark(
     ramp_up_strategy: Literal["linear", "exponential"] | None = None,
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
+    self_timed: bool = False,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
 ):
@@ -770,7 +814,27 @@ async def benchmark(
 
     distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
 
-    if ramp_up_strategy is not None:
+    if self_timed:
+        arrival_times = [
+            request.arrival_time
+            for request in input_requests
+            if request.arrival_time is not None
+        ]
+        if len(arrival_times) != len(input_requests):
+            raise ValueError(
+                "--self-timed requires every sample request to have an arrival_time."
+            )
+
+        trace_duration_s = max(arrival_times) if arrival_times else 0.0
+        approx_request_rate = (
+            len(input_requests) / trace_duration_s
+            if trace_duration_s > 0
+            else float("inf")
+        )
+        print("Traffic timing: dataset-provided request timestamps.")
+        print(f"Trace replay duration (s): {trace_duration_s}")
+        print(f"Approximate average request rate (RPS): {approx_request_rate}")
+    elif ramp_up_strategy is not None:
         print(f"Traffic ramp-up strategy: {ramp_up_strategy}.")
         print(
             f"Will increase RPS from {ramp_up_start_rps} to "
@@ -779,7 +843,8 @@ async def benchmark(
     else:
         print(f"Traffic request rate: {request_rate}")
 
-    print(f"Burstiness factor: {burstiness} ({distribution})")
+    if not self_timed:
+        print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
@@ -819,6 +884,7 @@ async def benchmark(
         ramp_up_strategy,
         ramp_up_start_rps,
         ramp_up_end_rps,
+        self_timed,
     ):
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
@@ -1011,6 +1077,9 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+
+    if any(request.arrival_time is not None for request in input_requests):
+        result["arrival_times"] = [request.arrival_time for request in input_requests]
 
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
@@ -1359,6 +1428,13 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "to synthesize the request arrival times.",
     )
     parser.add_argument(
+        "--self-timed",
+        action="store_true",
+        help="Replay request arrival times provided by the dataset instead of "
+        "synthesizing traffic from --request-rate. This is intended for "
+        "timestamped datasets such as timed_trace.",
+    )
+    parser.add_argument(
         "--burstiness",
         type=float,
         default=1.0,
@@ -1638,6 +1714,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     np.random.seed(args.seed)
 
     # Validate ramp-up arguments
+    if args.self_timed and args.ramp_up_strategy is not None:
+        raise ValueError("--self-timed cannot be used with --ramp-up-strategy.")
+    if args.self_timed and args.request_rate != float("inf"):
+        raise ValueError("--self-timed cannot be used with --request-rate.")
+
     if args.ramp_up_strategy is not None:
         if args.request_rate != float("inf"):
             raise ValueError(
@@ -1816,6 +1897,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_strategy=args.ramp_up_strategy,
         ramp_up_start_rps=args.ramp_up_start_rps,
         ramp_up_end_rps=args.ramp_up_end_rps,
+        self_timed=args.self_timed,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
     )
@@ -1848,6 +1930,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     result_json["request_rate"] = (
         args.request_rate if args.request_rate < float("inf") else "inf"
     )
+    result_json["self_timed"] = args.self_timed
     result_json["burstiness"] = args.burstiness
     result_json["max_concurrency"] = args.max_concurrency
 
@@ -1855,6 +1938,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         result_json["ramp_up_strategy"] = args.ramp_up_strategy
         result_json["ramp_up_start_rps"] = args.ramp_up_start_rps
         result_json["ramp_up_end_rps"] = args.ramp_up_end_rps
+
+    if args.dataset_name == "timed_trace":
+        result_json["timed_trace_chunk_hash_size"] = args.timed_trace_chunk_hash_size
+        result_json["timed_trace_sec_multiplier"] = args.timed_trace_sec_multiplier
 
     # Merge with benchmark result
     result_json = {**result_json, **benchmark_result}
@@ -1945,6 +2032,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "input_lens",
             "output_lens",
             "start_times",
+            "arrival_times",
             "ttfts",
             "itls",
             "generated_texts",

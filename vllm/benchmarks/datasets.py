@@ -10,6 +10,7 @@ generation. Supported dataset types include:
   - BurstGPT
   - HuggingFace
   - VisionArena
+  - TimedTrace
 """
 
 import argparse
@@ -71,12 +72,13 @@ class SampleRequest:
     Represents a single inference request for benchmarking.
     """
 
-    prompt: str | list[str]
+    prompt: str | list[str] | list[int] | list[list[int]]
     prompt_len: int
     expected_output_len: int
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
+    arrival_time: float | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -869,6 +871,256 @@ class RandomDatasetForReranking(RandomDataset):
 
 
 # -----------------------------------------------------------------------------
+# Timed Trace Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class TimedTraceDataset(BenchmarkDataset):
+    """
+    Replay a JSONL trace with explicit request timestamps.
+
+    Each non-empty JSONL row must contain:
+      - hash_ids: chunk identifiers for the prompt
+      - input_length: prompt length in tokens
+      - output_length: requested generation length in tokens
+      - timestamp: arrival time in seconds
+
+    The dataset maps each hash id to a deterministic synthetic token chunk so
+    repeated hash ids become repeated prompt-token blocks. For OpenAI-compatible
+    completions, callers should use token-id prompts to preserve exact prompt
+    length and prefix-cache structure.
+    """
+
+    DEFAULT_CHUNK_HASH_SIZE = 16
+    DEFAULT_SEC_MULTIPLIER = 1.0
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for timed_trace.")
+
+        self.data = []
+        with open(self.dataset_path, encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"Invalid timed_trace JSON at line {line_no}: {e}"
+                    ) from e
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"Invalid timed_trace line {line_no}: expected object."
+                    )
+                record = dict(record)
+                record["_line_no"] = line_no
+                self.data.append(record)
+
+        if not self.data:
+            raise ValueError(f"timed_trace file has no records: {self.dataset_path}")
+
+    @staticmethod
+    def _get_allowed_tokens(tokenizer: TokenizerLike) -> np.ndarray:
+        vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            raise ValueError("Tokenizer must expose a positive vocab_size.")
+
+        prohibited_tokens = set(getattr(tokenizer, "all_special_ids", []) or [])
+        added_tokens_decoder = getattr(tokenizer, "added_tokens_decoder", {}) or {}
+        for tok_id, token in added_tokens_decoder.items():
+            if getattr(token, "special", False):
+                prohibited_tokens.add(int(tok_id))
+
+        allowed_tokens = np.array(
+            [tok_id for tok_id in range(vocab_size) if tok_id not in prohibited_tokens]
+        )
+        if len(allowed_tokens) == 0:
+            raise ValueError("Tokenizer has no non-special tokens to sample from.")
+        return allowed_tokens
+
+    @staticmethod
+    def _make_chunk_tokens(
+        hash_id: int,
+        chunk_hash_size: int,
+        allowed_tokens: np.ndarray,
+    ) -> list[int]:
+        seed = int(hash_id) % (2**32)
+        rng = np.random.default_rng(seed)
+        token_offsets = rng.integers(
+            0, len(allowed_tokens), size=chunk_hash_size, dtype=np.int64
+        )
+        return allowed_tokens[token_offsets].astype(int).tolist()
+
+    @staticmethod
+    def _validate_record(
+        record: dict[str, Any],
+        *,
+        chunk_hash_size: int,
+        previous_timestamp: float | None,
+    ) -> tuple[list[int], int, int, float]:
+        line_no = record.get("_line_no", "?")
+        required = ("hash_ids", "input_length", "output_length", "timestamp")
+        missing = [key for key in required if key not in record]
+        if missing:
+            raise ValueError(
+                f"Invalid timed_trace line {line_no}: missing fields {missing}."
+            )
+
+        hash_ids = record["hash_ids"]
+        if not isinstance(hash_ids, list):
+            raise ValueError(
+                f"Invalid timed_trace line {line_no}: hash_ids must be a list."
+            )
+        try:
+            parsed_hash_ids = [int(hash_id) for hash_id in hash_ids]
+            input_len = int(record["input_length"])
+            output_len = int(record["output_length"])
+            timestamp = float(record["timestamp"])
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid timed_trace line {line_no}: bad field type."
+            ) from e
+
+        if input_len <= 0 or output_len <= 0:
+            raise ValueError(
+                f"Invalid timed_trace line {line_no}: input_length and "
+                "output_length must be positive."
+            )
+        if not math.isfinite(timestamp):
+            raise ValueError(
+                f"Invalid timed_trace line {line_no}: timestamp must be finite."
+            )
+        if previous_timestamp is not None and timestamp < previous_timestamp:
+            raise ValueError(
+                f"Invalid timed_trace line {line_no}: timestamp is not "
+                f"non-decreasing; previous={previous_timestamp}, "
+                f"current={timestamp}."
+            )
+
+        needed_hashes = math.ceil(input_len / chunk_hash_size)
+        if len(parsed_hash_ids) < needed_hashes:
+            raise ValueError(
+                f"Invalid timed_trace line {line_no}: hash_ids too short for "
+                f"input_length={input_len}, chunk_hash_size={chunk_hash_size}; "
+                f"need at least {needed_hashes}, got {len(parsed_hash_ids)}."
+            )
+
+        return parsed_hash_ids, input_len, output_len, timestamp
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        chunk_hash_size: int = DEFAULT_CHUNK_HASH_SIZE,
+        sec_multiplier: float = DEFAULT_SEC_MULTIPLIER,
+        return_token_ids: bool = True,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        if tokenizer is None:
+            raise ValueError("timed_trace requires tokenizer initialization.")
+        if chunk_hash_size <= 0:
+            raise ValueError("timed_trace chunk hash size must be positive.")
+        if sec_multiplier < 0:
+            raise ValueError("timed_trace sec multiplier must be non-negative.")
+
+        assert self.data is not None
+        num_available_samples = len(self.data)
+        if num_requests <= 0:
+            num_requests = num_available_samples
+            logger.info(
+                "num_requests is set to 0 or negative, so using all timed_trace "
+                "samples: %d",
+                num_requests,
+            )
+        elif num_requests > num_available_samples:
+            if no_oversample:
+                logger.info(
+                    "Skipping timed_trace oversampling. Total samples: %d.",
+                    num_available_samples,
+                )
+                num_requests = num_available_samples
+            else:
+                raise ValueError(
+                    "timed_trace cannot be oversampled because timestamps define "
+                    f"the workload. Requested {num_requests}, available "
+                    f"{num_available_samples}. Use --no-oversample or reduce "
+                    "--num-prompts."
+                )
+
+        allowed_tokens = self._get_allowed_tokens(tokenizer)
+        chunk_cache: dict[int, list[int]] = {}
+
+        requests: list[SampleRequest] = []
+        first_timestamp: float | None = None
+        previous_timestamp: float | None = None
+        token_mismatch_total = 0
+
+        for i, record in enumerate(self.data[:num_requests]):
+            hash_ids, input_len, output_len, timestamp = self._validate_record(
+                record,
+                chunk_hash_size=chunk_hash_size,
+                previous_timestamp=previous_timestamp,
+            )
+            previous_timestamp = timestamp
+            if first_timestamp is None:
+                first_timestamp = timestamp
+
+            needed_hashes = math.ceil(input_len / chunk_hash_size)
+            prompt_token_ids: list[int] = []
+            for hash_id in hash_ids[:needed_hashes]:
+                if hash_id not in chunk_cache:
+                    chunk_cache[hash_id] = self._make_chunk_tokens(
+                        hash_id, chunk_hash_size, allowed_tokens
+                    )
+                prompt_token_ids.extend(chunk_cache[hash_id])
+            prompt_token_ids = prompt_token_ids[:input_len]
+
+            if return_token_ids:
+                prompt: str | list[int] = prompt_token_ids
+                prompt_len = input_len
+            else:
+                prompt, adjusted_token_ids, token_mismatch = (
+                    gen_prompt_decode_to_target_len(
+                        tokenizer=tokenizer,
+                        token_sequence=prompt_token_ids,
+                        target_token_len=input_len,
+                        add_special_tokens=False,
+                    )
+                )
+                prompt_len = len(adjusted_token_ids)
+                token_mismatch_total += token_mismatch
+
+            requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    request_id=request_id_prefix + str(i),
+                    arrival_time=(timestamp - first_timestamp) * sec_multiplier,
+                )
+            )
+
+        if token_mismatch_total != 0:
+            sign = "more" if token_mismatch_total > 0 else "fewer"
+            logger.warning(
+                "Across all timed_trace text prompts, there were %d %s tokens "
+                "than expected after decoding and re-encoding.",
+                abs(token_mismatch_total),
+                sign,
+            )
+
+        return requests
+
+
+# -----------------------------------------------------------------------------
 # MultiModalDataset Implementation
 # -----------------------------------------------------------------------------
 
@@ -1436,6 +1688,7 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
             "custom_mm",
             "prefix_repetition",
             "spec_bench",
+            "timed_trace",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -1562,6 +1815,22 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         "random multimodal dataset options extended from random dataset"
     )
     add_random_multimodal_dataset_args(random_mm_group)
+
+    timed_trace_group = parser.add_argument_group("timed trace dataset options")
+    timed_trace_group.add_argument(
+        "--timed-trace-chunk-hash-size",
+        type=int,
+        default=TimedTraceDataset.DEFAULT_CHUNK_HASH_SIZE,
+        help="Number of input tokens represented by each hash id in a "
+        "timed_trace row.",
+    )
+    timed_trace_group.add_argument(
+        "--timed-trace-sec-multiplier",
+        type=float,
+        default=TimedTraceDataset.DEFAULT_SEC_MULTIPLIER,
+        help="Scale factor applied to timed_trace request arrival intervals. "
+        "For example, 0.5 doubles the replay rate and 2.0 halves it.",
+    )
 
     hf_group = parser.add_argument_group("hf dataset options")
     hf_group.add_argument(
@@ -2058,6 +2327,19 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 request_id_prefix=args.request_id_prefix,
                 batchsize=args.random_batch_size,
                 is_reranker=not args.no_reranker,
+            ),
+            "timed_trace": lambda: TimedTraceDataset(
+                random_seed=args.seed,
+                dataset_path=args.dataset_path,
+                disable_shuffle=True,
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                chunk_hash_size=args.timed_trace_chunk_hash_size,
+                sec_multiplier=args.timed_trace_sec_multiplier,
+                return_token_ids=args.backend in ("openai", "vllm"),
+                request_id_prefix=args.request_id_prefix,
+                no_oversample=args.no_oversample,
             ),
             "prefix_repetition": lambda: PrefixRepetitionRandomDataset(
                 random_seed=args.seed,
