@@ -80,6 +80,81 @@ def test_timed_trace_dataset_replays_hash_chunks_and_timestamps(tmp_path):
 
 
 @pytest.mark.benchmark
+def test_timed_trace_dataset_compresses_idle_gaps(tmp_path):
+    trace_path = tmp_path / "trace.jsonl"
+    _write_jsonl(
+        trace_path,
+        [
+            {
+                "hash_ids": [1],
+                "input_length": 1,
+                "output_length": 1,
+                "timestamp": 10.0,
+            },
+            {
+                "hash_ids": [2],
+                "input_length": 1,
+                "output_length": 1,
+                "timestamp": 30.0,
+            },
+            {
+                "hash_ids": [3],
+                "input_length": 1,
+                "output_length": 1,
+                "timestamp": 150.0,
+            },
+        ],
+    )
+
+    dataset = TimedTraceDataset(dataset_path=str(trace_path))
+    samples = dataset.sample(
+        tokenizer=FakeTokenizer(),
+        num_requests=3,
+        chunk_hash_size=1,
+        sec_multiplier=0.5,
+        idle_gap_threshold=60.0,
+        idle_sec_multiplier=0.1,
+    )
+
+    assert [sample.arrival_time for sample in samples] == pytest.approx(
+        [0.0, 10.0, 46.0]
+    )
+
+
+@pytest.mark.benchmark
+def test_timed_trace_idle_threshold_uses_regular_multiplier_by_default(tmp_path):
+    trace_path = tmp_path / "trace.jsonl"
+    _write_jsonl(
+        trace_path,
+        [
+            {
+                "hash_ids": [1],
+                "input_length": 1,
+                "output_length": 1,
+                "timestamp": 0.0,
+            },
+            {
+                "hash_ids": [2],
+                "input_length": 1,
+                "output_length": 1,
+                "timestamp": 120.0,
+            },
+        ],
+    )
+
+    dataset = TimedTraceDataset(dataset_path=str(trace_path))
+    samples = dataset.sample(
+        tokenizer=FakeTokenizer(),
+        num_requests=2,
+        chunk_hash_size=1,
+        sec_multiplier=0.5,
+        idle_gap_threshold=60.0,
+    )
+
+    assert samples[1].arrival_time == 60.0
+
+
+@pytest.mark.benchmark
 def test_timed_trace_dataset_rejects_unsorted_timestamps(tmp_path):
     trace_path = tmp_path / "trace.jsonl"
     _write_jsonl(

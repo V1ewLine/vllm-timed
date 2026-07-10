@@ -1942,6 +1942,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     if args.dataset_name == "timed_trace":
         result_json["timed_trace_chunk_hash_size"] = args.timed_trace_chunk_hash_size
         result_json["timed_trace_sec_multiplier"] = args.timed_trace_sec_multiplier
+        result_json["timed_trace_idle_gap_threshold"] = (
+            args.timed_trace_idle_gap_threshold
+        )
+        result_json["timed_trace_idle_sec_multiplier"] = (
+            args.timed_trace_idle_sec_multiplier
+        )
 
     # Merge with benchmark result
     result_json = {**result_json, **benchmark_result}

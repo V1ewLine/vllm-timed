@@ -893,6 +893,8 @@ class TimedTraceDataset(BenchmarkDataset):
 
     DEFAULT_CHUNK_HASH_SIZE = 16
     DEFAULT_SEC_MULTIPLIER = 1.0
+    DEFAULT_IDLE_GAP_THRESHOLD: float | None = None
+    DEFAULT_IDLE_SEC_MULTIPLIER: float | None = None
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -1021,6 +1023,8 @@ class TimedTraceDataset(BenchmarkDataset):
         no_oversample: bool = False,
         chunk_hash_size: int = DEFAULT_CHUNK_HASH_SIZE,
         sec_multiplier: float = DEFAULT_SEC_MULTIPLIER,
+        idle_gap_threshold: float | None = DEFAULT_IDLE_GAP_THRESHOLD,
+        idle_sec_multiplier: float | None = DEFAULT_IDLE_SEC_MULTIPLIER,
         return_token_ids: bool = True,
         **kwargs,
     ) -> list[SampleRequest]:
@@ -1030,6 +1034,24 @@ class TimedTraceDataset(BenchmarkDataset):
             raise ValueError("timed_trace chunk hash size must be positive.")
         if sec_multiplier < 0:
             raise ValueError("timed_trace sec multiplier must be non-negative.")
+        if idle_gap_threshold is not None and idle_gap_threshold <= 0:
+            raise ValueError(
+                "timed_trace idle gap threshold must be positive when set."
+            )
+        if idle_sec_multiplier is not None and idle_sec_multiplier < 0:
+            raise ValueError(
+                "timed_trace idle sec multiplier must be non-negative when set."
+            )
+        if idle_gap_threshold is None and idle_sec_multiplier is not None:
+            raise ValueError(
+                "timed_trace idle sec multiplier requires an idle gap threshold."
+            )
+
+        effective_idle_multiplier = (
+            sec_multiplier
+            if idle_sec_multiplier is None
+            else idle_sec_multiplier
+        )
 
         assert self.data is not None
         num_available_samples = len(self.data)
@@ -1061,6 +1083,7 @@ class TimedTraceDataset(BenchmarkDataset):
         requests: list[SampleRequest] = []
         first_timestamp: float | None = None
         previous_timestamp: float | None = None
+        arrival_time = 0.0
         token_mismatch_total = 0
 
         for i, record in enumerate(self.data[:num_requests]):
@@ -1069,9 +1092,24 @@ class TimedTraceDataset(BenchmarkDataset):
                 chunk_hash_size=chunk_hash_size,
                 previous_timestamp=previous_timestamp,
             )
-            previous_timestamp = timestamp
             if first_timestamp is None:
                 first_timestamp = timestamp
+            else:
+                assert previous_timestamp is not None
+                raw_gap = timestamp - previous_timestamp
+                if (
+                    idle_gap_threshold is not None
+                    and raw_gap > idle_gap_threshold
+                ):
+                    scaled_gap = (
+                        idle_gap_threshold * sec_multiplier
+                        + (raw_gap - idle_gap_threshold)
+                        * effective_idle_multiplier
+                    )
+                else:
+                    scaled_gap = raw_gap * sec_multiplier
+                arrival_time += scaled_gap
+            previous_timestamp = timestamp
 
             needed_hashes = math.ceil(input_len / chunk_hash_size)
             prompt_token_ids: list[int] = []
@@ -1104,7 +1142,7 @@ class TimedTraceDataset(BenchmarkDataset):
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
                     request_id=request_id_prefix + str(i),
-                    arrival_time=(timestamp - first_timestamp) * sec_multiplier,
+                    arrival_time=arrival_time,
                 )
             )
 
@@ -1831,6 +1869,21 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         help="Scale factor applied to timed_trace request arrival intervals. "
         "For example, 0.5 doubles the replay rate and 2.0 halves it.",
     )
+    timed_trace_group.add_argument(
+        "--timed-trace-idle-gap-threshold",
+        type=float,
+        default=TimedTraceDataset.DEFAULT_IDLE_GAP_THRESHOLD,
+        help="Treat timed_trace arrival gaps above this many seconds as idle "
+        "gaps. By default, all gaps use --timed-trace-sec-multiplier.",
+    )
+    timed_trace_group.add_argument(
+        "--timed-trace-idle-sec-multiplier",
+        type=float,
+        default=TimedTraceDataset.DEFAULT_IDLE_SEC_MULTIPLIER,
+        help="Scale only the portion of an idle gap above "
+        "--timed-trace-idle-gap-threshold. Defaults to the regular timed "
+        "trace multiplier.",
+    )
 
     hf_group = parser.add_argument_group("hf dataset options")
     hf_group.add_argument(
@@ -2337,6 +2390,8 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 num_requests=args.num_prompts,
                 chunk_hash_size=args.timed_trace_chunk_hash_size,
                 sec_multiplier=args.timed_trace_sec_multiplier,
+                idle_gap_threshold=args.timed_trace_idle_gap_threshold,
+                idle_sec_multiplier=args.timed_trace_idle_sec_multiplier,
                 return_token_ids=args.backend in ("openai", "vllm"),
                 request_id_prefix=args.request_id_prefix,
                 no_oversample=args.no_oversample,
