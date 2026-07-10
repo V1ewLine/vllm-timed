@@ -455,6 +455,7 @@ uv run vllm bench serve \
   --save-result \
   --save-detailed \
   --plot-timeline \
+  --plot-trace \
   --plot-dataset-stats \
   --result-dir "${RESULT_DIR}" \
   --result-filename "${RESULT_FILENAME}" \

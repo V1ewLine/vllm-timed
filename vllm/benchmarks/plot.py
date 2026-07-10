@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Generate plots for benchmark results."""
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +10,19 @@ from vllm.utils.import_utils import PlaceholderModule
 
 try:
     import plotly.express as px
-    import plotly.io as pio
 except ImportError:
     _plotly = PlaceholderModule("plotly")
     px = _plotly.placeholder_attr("express")
+
+try:
+    import plotly.graph_objects as go
+    import plotly.io as pio
+    from plotly.subplots import make_subplots
+except ImportError:
+    _plotly = PlaceholderModule("plotly")
+    go = _plotly.placeholder_attr("graph_objects")
     pio = _plotly.placeholder_attr("io")
+    make_subplots = _plotly.placeholder_attr("subplots.make_subplots")
 
 try:
     import matplotlib.pyplot as plt
@@ -223,6 +232,192 @@ def construct_timeline_data(
             prev_time_str = itl_end_str
 
     return timeline_data
+
+
+def construct_trace_plot_data(
+    arrival_times: list[float],
+    start_times: list[float],
+    latencies: list[float],
+    successes: list[bool],
+    bin_width: float | None = None,
+) -> dict[str, Any]:
+    """Build scheduled and observed request-rate and cumulative series."""
+    lengths = {
+        len(arrival_times),
+        len(start_times),
+        len(latencies),
+        len(successes),
+    }
+    if len(lengths) != 1:
+        raise ValueError("Trace plot inputs must have the same length.")
+    if not arrival_times:
+        return {}
+    if any(not math.isfinite(value) for value in arrival_times + start_times):
+        raise ValueError("Trace plot timestamps must be finite.")
+    if any(not math.isfinite(value) or value < 0 for value in latencies):
+        raise ValueError("Trace plot latencies must be finite and non-negative.")
+
+    first_start = min(start_times)
+    observed_starts = [start_time - first_start for start_time in start_times]
+    completion_times = sorted(
+        observed_start + latency
+        for observed_start, latency, success in zip(
+            observed_starts, latencies, successes
+        )
+        if success
+    )
+    scheduled_arrivals = sorted(arrival_times)
+    observed_starts.sort()
+
+    max_time = max(
+        scheduled_arrivals[-1],
+        observed_starts[-1],
+        completion_times[-1] if completion_times else 0.0,
+    )
+    if bin_width is None:
+        target_width = max_time / 300 if max_time > 0 else 1.0
+        nice_widths = [
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            30.0,
+            60.0,
+            120.0,
+            300.0,
+            600.0,
+        ]
+        bin_width = next(
+            (width for width in nice_widths if width >= target_width),
+            nice_widths[-1],
+        )
+    if not math.isfinite(bin_width) or bin_width <= 0:
+        raise ValueError("Trace plot bin width must be finite and positive.")
+
+    bucket_count = max(1, int(max_time // bin_width) + 1)
+    bucket_centers = [(index + 0.5) * bin_width for index in range(bucket_count)]
+
+    def request_rates(timestamps: list[float]) -> list[float]:
+        counts = [0] * bucket_count
+        for timestamp in timestamps:
+            bucket = min(int(timestamp // bin_width), bucket_count - 1)
+            counts[bucket] += 1
+        return [count / bin_width for count in counts]
+
+    return {
+        "bin_width": bin_width,
+        "bucket_centers": bucket_centers,
+        "scheduled_rates": request_rates(scheduled_arrivals),
+        "observed_rates": request_rates(observed_starts),
+        "completion_rates": request_rates(completion_times),
+        "scheduled_arrivals": scheduled_arrivals,
+        "observed_starts": observed_starts,
+        "completion_times": completion_times,
+    }
+
+
+def generate_trace_plot(
+    arrival_times: list[float],
+    start_times: list[float],
+    latencies: list[float],
+    successes: list[bool],
+    output_path: Path,
+) -> None:
+    """Generate an HTML plot comparing scheduled and observed request traffic."""
+    data = construct_trace_plot_data(
+        arrival_times=arrival_times,
+        start_times=start_times,
+        latencies=latencies,
+        successes=successes,
+    )
+    if not data:
+        print("No request trace data to plot")
+        return
+
+    colors = {
+        "scheduled": "#6B7280",
+        "observed": "#2563EB",
+        "completed": "#D97706",
+    }
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=(
+            f"Request rate ({data['bin_width']:g}s buckets)",
+            "Cumulative requests",
+        ),
+    )
+
+    rate_series = [
+        ("Scheduled arrivals", "scheduled_rates", "scheduled", "dash"),
+        ("Observed starts", "observed_rates", "observed", "solid"),
+        ("Successful completions", "completion_rates", "completed", "dot"),
+    ]
+    for name, field, color, dash in rate_series:
+        fig.add_trace(
+            go.Scatter(
+                x=data["bucket_centers"],
+                y=data[field],
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                line={"color": colors[color], "width": 2, "dash": dash},
+                hovertemplate="Time: %{x:.3f}s<br>Rate: %{y:.3f} req/s<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
+    cumulative_series = [
+        ("Scheduled arrivals", "scheduled_arrivals", "scheduled", "dash"),
+        ("Observed starts", "observed_starts", "observed", "solid"),
+        ("Successful completions", "completion_times", "completed", "dot"),
+    ]
+    for name, field, color, dash in cumulative_series:
+        timestamps = data[field]
+        fig.add_trace(
+            go.Scatter(
+                x=timestamps,
+                y=list(range(1, len(timestamps) + 1)),
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                showlegend=False,
+                line={"color": colors[color], "width": 2, "dash": dash},
+                line_shape="hv",
+                hovertemplate="Time: %{x:.3f}s<br>Requests: %{y}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+
+    fig.update_xaxes(title_text="Seconds since first observed request", row=2, col=1)
+    fig.update_yaxes(
+        title_text="Requests / second", rangemode="tozero", row=1, col=1
+    )
+    fig.update_yaxes(title_text="Request count", rangemode="tozero", row=2, col=1)
+    fig.update_layout(
+        title={
+            "text": "Scheduled vs observed request trace",
+            "x": 0.02,
+            "xanchor": "left",
+        },
+        template="plotly_white",
+        hovermode="x unified",
+        height=800,
+        legend={"orientation": "h", "y": 1.08, "x": 0},
+        margin={"l": 80, "r": 30, "t": 110, "b": 70},
+    )
+    pio.write_html(fig, str(output_path))
+    print(f"Request trace plot saved to: {output_path}")
 
 
 def generate_dataset_stats_plot(

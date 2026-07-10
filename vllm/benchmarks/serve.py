@@ -1061,6 +1061,8 @@ async def benchmark(
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
             "start_times": [output.start_time for output in outputs],
+            "latencies": [output.latency for output in outputs],
+            "successes": [output.success for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
@@ -1282,7 +1284,13 @@ def compute_result_filename(
     Returns:
         The computed filename path or None if no result saving is requested
     """
-    if not (args.plot_timeline or args.save_result or args.append_result):
+    if not (
+        args.plot_timeline
+        or args.plot_trace
+        or args.plot_dataset_stats
+        or args.save_result
+        or args.append_result
+    ):
         return None
 
     base_model_id = model_id.split("/")[-1]
@@ -1686,6 +1694,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "The plot will be saved alongside the results JSON file.",
     )
     parser.add_argument(
+        "--plot-trace",
+        action="store_true",
+        help="Generate an HTML plot comparing scheduled request arrivals with "
+        "observed request starts and successful completions.",
+    )
+    parser.add_argument(
         "--timeline-itl-thresholds",
         type=float,
         nargs=2,
@@ -1999,6 +2013,34 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as e:
             warnings.warn(f"Failed to generate timeline plot: {e}", stacklevel=2)
 
+    # Generate scheduled-vs-observed request trace plot
+    if args.plot_trace:
+        try:
+            from vllm.benchmarks.plot import generate_trace_plot
+
+            arrival_times = benchmark_result.get("arrival_times", [])
+            start_times = benchmark_result.get("start_times", [])
+            latencies = benchmark_result.get("latencies", [])
+            successes = benchmark_result.get("successes", [])
+
+            if arrival_times and start_times and latencies and successes:
+                trace_path = Path(file_name).with_suffix(".trace.html")
+                generate_trace_plot(
+                    arrival_times=arrival_times,
+                    start_times=start_times,
+                    latencies=latencies,
+                    successes=successes,
+                    output_path=trace_path,
+                )
+            else:
+                warnings.warn(
+                    "Request trace plot requires dataset arrival timestamps "
+                    "and detailed request metrics.",
+                    stacklevel=2,
+                )
+        except Exception as e:
+            warnings.warn(f"Failed to generate request trace plot: {e}", stacklevel=2)
+
     # Generate dataset statistics plot if requested
     if args.plot_dataset_stats:
         try:
@@ -2039,6 +2081,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "output_lens",
             "start_times",
             "arrival_times",
+            "latencies",
+            "successes",
             "ttfts",
             "itls",
             "generated_texts",
