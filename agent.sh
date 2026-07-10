@@ -454,7 +454,6 @@ uv run vllm bench serve \
   --timed-trace-idle-sec-multiplier "${TIMED_TRACE_IDLE_SEC_MULTIPLIER}" \
   --save-result \
   --save-detailed \
-  --plot-timeline \
   --plot-trace \
   --plot-dataset-stats \
   --result-dir "${RESULT_DIR}" \

@@ -3,7 +3,10 @@
 
 import pytest
 
-from vllm.benchmarks.plot import construct_trace_plot_data
+from vllm.benchmarks.plot import (
+    construct_trace_plot_data,
+    generate_benchmark_plots,
+)
 
 
 @pytest.mark.benchmark
@@ -33,3 +36,25 @@ def test_construct_trace_plot_data_rejects_mismatched_lengths():
             latencies=[1.0],
             successes=[True],
         )
+
+
+@pytest.mark.benchmark
+def test_generate_benchmark_plots_writes_four_pngs(tmp_path):
+    result = {
+        "arrival_times": [0.0, 0.5, 1.0, 1.5],
+        "start_times": [100.0, 100.6, 101.2, 101.8],
+        "latencies": [0.8, 0.7, 0.9, 0.6],
+        "successes": [True, True, False, True],
+        "input_lens": [128, 512, 2048, 8192],
+        "output_lens": [32, 128, 256, 1024],
+    }
+
+    paths = generate_benchmark_plots(result, tmp_path, prefix="run")
+
+    assert {path.name for path in paths} == {
+        "run.trace.png",
+        "run.input_distribution.png",
+        "run.output_distribution.png",
+        "run.input_output_distribution.png",
+    }
+    assert all(path.stat().st_size > 0 for path in paths)

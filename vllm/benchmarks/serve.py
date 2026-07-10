@@ -1696,7 +1696,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--plot-trace",
         action="store_true",
-        help="Generate an HTML plot comparing scheduled request arrivals with "
+        help="Generate a static PNG comparing scheduled request arrivals with "
         "observed request starts and successful completions.",
     )
     parser.add_argument(
@@ -1713,8 +1713,8 @@ def add_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--plot-dataset-stats",
         action="store_true",
-        help="Generate a matplotlib figure with dataset statistics showing "
-        "prompt tokens, output tokens, and combined token distributions.",
+        help="Generate static PNGs for input length, output length, and the "
+        "joint input/output distribution of this benchmark.",
     )
 
 
@@ -2013,65 +2013,27 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as e:
             warnings.warn(f"Failed to generate timeline plot: {e}", stacklevel=2)
 
-    # Generate scheduled-vs-observed request trace plot
-    if args.plot_trace:
+    # Generate static plots from this benchmark's detailed metrics.
+    if args.plot_trace or args.plot_dataset_stats:
         try:
-            from vllm.benchmarks.plot import generate_trace_plot
+            from vllm.benchmarks.plot import generate_benchmark_plots
 
-            arrival_times = benchmark_result.get("arrival_times", [])
-            start_times = benchmark_result.get("start_times", [])
-            latencies = benchmark_result.get("latencies", [])
-            successes = benchmark_result.get("successes", [])
+            selected_plots = []
+            if args.plot_trace:
+                selected_plots.append("trace")
+            if args.plot_dataset_stats:
+                selected_plots.extend(("input", "output", "input-output"))
 
-            if arrival_times and start_times and latencies and successes:
-                trace_path = Path(file_name).with_suffix(".trace.html")
-                generate_trace_plot(
-                    arrival_times=arrival_times,
-                    start_times=start_times,
-                    latencies=latencies,
-                    successes=successes,
-                    output_path=trace_path,
-                )
-            else:
-                warnings.warn(
-                    "Request trace plot requires dataset arrival timestamps "
-                    "and detailed request metrics.",
-                    stacklevel=2,
-                )
-        except Exception as e:
-            warnings.warn(f"Failed to generate request trace plot: {e}", stacklevel=2)
-
-    # Generate dataset statistics plot if requested
-    if args.plot_dataset_stats:
-        try:
-            from vllm.benchmarks.plot import generate_dataset_stats_plot
-
-            # Prepare per-request data for dataset stats
-            per_request_data = []
-            input_lens = benchmark_result.get("input_lens", [])
-            output_lens = benchmark_result.get("output_lens", [])
-
-            if input_lens and output_lens:
-                for req_input_len, req_output_len in zip(input_lens, output_lens):
-                    per_request_data.append(
-                        {
-                            "prompt_len": req_input_len,
-                            "output_tokens": req_output_len,
-                        }
-                    )
-
-                stats_path = Path(file_name).with_suffix(".dataset_stats.png")
-                generate_dataset_stats_plot(per_request_data, stats_path)
-            else:
-                warnings.warn(
-                    "Dataset statistics plot requires input and "
-                    "output length data. Ensure the benchmark completed "
-                    "successfully.",
-                    stacklevel=2,
-                )
+            result_path = Path(file_name)
+            generate_benchmark_plots(
+                result=benchmark_result,
+                output_dir=result_path.parent,
+                prefix=result_path.stem,
+                plots=selected_plots,
+            )
         except Exception as e:
             warnings.warn(
-                f"Failed to generate dataset statistics plot: {e}", stacklevel=2
+                f"Failed to generate benchmark plots: {e}", stacklevel=2
             )
 
     if not args.save_detailed:

@@ -2,33 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Generate plots for benchmark results."""
 
+import argparse
+import json
 import math
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from vllm.utils.import_utils import PlaceholderModule
-
 try:
     import plotly.express as px
-except ImportError:
-    _plotly = PlaceholderModule("plotly")
-    px = _plotly.placeholder_attr("express")
-
-try:
-    import plotly.graph_objects as go
     import plotly.io as pio
-    from plotly.subplots import make_subplots
 except ImportError:
-    _plotly = PlaceholderModule("plotly")
-    go = _plotly.placeholder_attr("graph_objects")
-    pio = _plotly.placeholder_attr("io")
-    make_subplots = _plotly.placeholder_attr("subplots.make_subplots")
+    px = None
+    pio = None
 
 try:
     import matplotlib.pyplot as plt
 except ImportError:
-    _matplotlib = PlaceholderModule("matplotlib")
-    plt = _matplotlib.placeholder_attr("pyplot")
+    plt = None
 
 
 def generate_timeline_plot(
@@ -54,6 +45,8 @@ def generate_timeline_plot(
         itl_thresholds: ITL thresholds in seconds (default: [1.0, 4.0, 6.0])
         labels: Labels for ITL categories (default based on thresholds)
     """
+    if px is None or pio is None:
+        raise ImportError("Timeline plotting requires Plotly and pandas.")
 
     # Set defaults
     if colors is None:
@@ -329,7 +322,9 @@ def generate_trace_plot(
     successes: list[bool],
     output_path: Path,
 ) -> None:
-    """Generate an HTML plot comparing scheduled and observed request traffic."""
+    """Generate a PNG comparing scheduled and observed request traffic."""
+    if plt is None:
+        raise ImportError("Static benchmark plotting requires Matplotlib.")
     data = construct_trace_plot_data(
         arrival_times=arrival_times,
         start_times=start_times,
@@ -340,84 +335,282 @@ def generate_trace_plot(
         print("No request trace data to plot")
         return
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, (rate_ax, cumulative_ax) = plt.subplots(
+        2,
+        1,
+        figsize=(14, 9),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.1, 1]},
+    )
+
+    series = [
+        ("Scheduled arrivals", "scheduled", "--"),
+        ("Observed starts", "observed", "-"),
+        ("Successful completions", "completion", ":"),
+    ]
     colors = {
         "scheduled": "#6B7280",
         "observed": "#2563EB",
-        "completed": "#D97706",
+        "completion": "#D97706",
     }
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.12,
-        subplot_titles=(
-            f"Request rate ({data['bin_width']:g}s buckets)",
-            "Cumulative requests",
-        ),
-    )
-
-    rate_series = [
-        ("Scheduled arrivals", "scheduled_rates", "scheduled", "dash"),
-        ("Observed starts", "observed_rates", "observed", "solid"),
-        ("Successful completions", "completion_rates", "completed", "dot"),
-    ]
-    for name, field, color, dash in rate_series:
-        fig.add_trace(
-            go.Scatter(
-                x=data["bucket_centers"],
-                y=data[field],
-                mode="lines",
-                name=name,
-                legendgroup=name,
-                line={"color": colors[color], "width": 2, "dash": dash},
-                hovertemplate="Time: %{x:.3f}s<br>Rate: %{y:.3f} req/s<extra></extra>",
-            ),
-            row=1,
-            col=1,
+    for label, key, line_style in series:
+        rate_ax.plot(
+            data["bucket_centers"],
+            data[f"{key}_rates"],
+            label=label,
+            color=colors[key],
+            linestyle=line_style,
+            linewidth=1.8,
+        )
+        timestamps = data[
+            {
+                "scheduled": "scheduled_arrivals",
+                "observed": "observed_starts",
+                "completion": "completion_times",
+            }[key]
+        ]
+        cumulative_ax.step(
+            timestamps,
+            range(1, len(timestamps) + 1),
+            where="post",
+            color=colors[key],
+            linestyle=line_style,
+            linewidth=1.8,
         )
 
-    cumulative_series = [
-        ("Scheduled arrivals", "scheduled_arrivals", "scheduled", "dash"),
-        ("Observed starts", "observed_starts", "observed", "solid"),
-        ("Successful completions", "completion_times", "completed", "dot"),
-    ]
-    for name, field, color, dash in cumulative_series:
-        timestamps = data[field]
-        fig.add_trace(
-            go.Scatter(
-                x=timestamps,
-                y=list(range(1, len(timestamps) + 1)),
-                mode="lines",
-                name=name,
-                legendgroup=name,
-                showlegend=False,
-                line={"color": colors[color], "width": 2, "dash": dash},
-                line_shape="hv",
-                hovertemplate="Time: %{x:.3f}s<br>Requests: %{y}<extra></extra>",
-            ),
-            row=2,
-            col=1,
-        )
+    rate_ax.set_title(
+        f"Request Rate ({data['bin_width']:g}s buckets)", loc="left", fontsize=12
+    )
+    rate_ax.set_ylabel("Requests / second")
+    rate_ax.legend(loc="upper right", ncols=3, frameon=False)
+    rate_ax.grid(True, color="#D1D5DB", alpha=0.55, linewidth=0.8)
+    rate_ax.set_ylim(bottom=0)
 
-    fig.update_xaxes(title_text="Seconds since first observed request", row=2, col=1)
-    fig.update_yaxes(
-        title_text="Requests / second", rangemode="tozero", row=1, col=1
+    cumulative_ax.set_title("Cumulative Requests", loc="left", fontsize=12)
+    cumulative_ax.set_xlabel("Seconds since first observed request")
+    cumulative_ax.set_ylabel("Request count")
+    cumulative_ax.grid(True, color="#D1D5DB", alpha=0.55, linewidth=0.8)
+    cumulative_ax.set_ylim(bottom=0)
+
+    fig.suptitle(
+        "Scheduled vs Observed Benchmark Trace",
+        x=0.07,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
     )
-    fig.update_yaxes(title_text="Request count", rangemode="tozero", row=2, col=1)
-    fig.update_layout(
-        title={
-            "text": "Scheduled vs observed request trace",
-            "x": 0.02,
-            "xanchor": "left",
-        },
-        template="plotly_white",
-        hovermode="x unified",
-        height=800,
-        legend={"orientation": "h", "y": 1.08, "x": 0},
-        margin={"l": 80, "r": 30, "t": 110, "b": 70},
-    )
-    pio.write_html(fig, str(output_path))
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(output_path, dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
     print(f"Request trace plot saved to: {output_path}")
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    return float(
+        ordered[lower] * (upper - position)
+        + ordered[upper] * (position - lower)
+    )
+
+
+def _distribution_bins(
+    values: Sequence[int], count: int = 40
+) -> tuple[list[float], bool]:
+    minimum = min(values)
+    maximum = max(values)
+    use_log_scale = minimum > 0 and maximum / minimum >= 20
+    if not use_log_scale or minimum == maximum:
+        width = max(1.0, (maximum - minimum) / count)
+        return [minimum + index * width for index in range(count + 1)], False
+
+    ratio = (maximum / minimum) ** (1 / count)
+    return [minimum * ratio**index for index in range(count + 1)], True
+
+
+def generate_length_distribution_plot(
+    values: list[int],
+    output_path: Path,
+    *,
+    title: str,
+    xlabel: str,
+    color: str,
+) -> None:
+    """Generate a request-length histogram with key workload quantiles."""
+    if plt is None:
+        raise ImportError("Static benchmark plotting requires Matplotlib.")
+    if not values:
+        raise ValueError(f"No values available for {title}.")
+    if any(value < 0 for value in values):
+        raise ValueError(f"{title} values must be non-negative.")
+
+    bins, use_log_scale = _distribution_bins(values)
+    quantiles = [
+        ("P50", _percentile(values, 0.50), "-"),
+        ("P90", _percentile(values, 0.90), "--"),
+        ("P99", _percentile(values, 0.99), ":"),
+    ]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    ax.hist(values, bins=bins, color=color, edgecolor="#1F2937", alpha=0.82)
+    for label, value, line_style in quantiles:
+        ax.axvline(
+            value,
+            color="#111827",
+            linestyle=line_style,
+            linewidth=1.4,
+            label=f"{label}: {value:,.0f}",
+        )
+    if use_log_scale:
+        ax.set_xscale("log")
+        scale_note = "Log-scaled token axis"
+    else:
+        scale_note = "Linear token axis"
+
+    fig.suptitle(
+        title,
+        x=0.08,
+        y=0.98,
+        ha="left",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.text(
+        0.08,
+        0.93,
+        f"{len(values):,} requests | {scale_note}",
+        color="#4B5563",
+        fontsize=10,
+    )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Request count")
+    ax.grid(True, axis="y", color="#D1D5DB", alpha=0.55, linewidth=0.8)
+    ax.legend(frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.89))
+    fig.savefig(output_path, dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Length distribution plot saved to: {output_path}")
+
+
+def generate_input_output_distribution_plot(
+    input_lens: list[int],
+    output_lens: list[int],
+    output_path: Path,
+) -> None:
+    """Generate the joint input/output token distribution for all requests."""
+    if plt is None:
+        raise ImportError("Static benchmark plotting requires Matplotlib.")
+    if not input_lens or len(input_lens) != len(output_lens):
+        raise ValueError("Input and output lengths must be non-empty and aligned.")
+    if any(value <= 0 for value in input_lens):
+        raise ValueError("Input lengths must be positive.")
+    if any(value < 0 for value in output_lens):
+        raise ValueError("Output lengths must be non-negative.")
+
+    output_scale = "log" if min(output_lens) > 0 else "linear"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    density = ax.hexbin(
+        input_lens,
+        output_lens,
+        gridsize=42,
+        mincnt=1,
+        bins="log",
+        xscale="log",
+        yscale=output_scale,
+        cmap="Blues",
+        linewidths=0.3,
+    )
+    colorbar = fig.colorbar(density, ax=ax, pad=0.02)
+    colorbar.set_label("Samples per bin (log scale)")
+    fig.suptitle(
+        "Input vs Output Length Distribution",
+        x=0.08,
+        y=0.98,
+        ha="left",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.text(
+        0.08,
+        0.93,
+        f"All {len(input_lens):,} requests from this benchmark",
+        color="#4B5563",
+        fontsize=10,
+    )
+    ax.set_xlabel("Input tokens (log scale)")
+    ax.set_ylabel(f"Output tokens ({output_scale} scale)")
+    ax.grid(True, which="major", color="#D1D5DB", alpha=0.45, linewidth=0.8)
+    fig.tight_layout(rect=(0, 0, 1, 0.89))
+    fig.savefig(output_path, dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Input/output distribution plot saved to: {output_path}")
+
+
+def generate_benchmark_plots(
+    result: Mapping[str, Any],
+    output_dir: Path,
+    prefix: str = "benchmark",
+    plots: Sequence[str] = ("trace", "input", "output", "input-output"),
+) -> list[Path]:
+    """Generate selected plots from one detailed benchmark result."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    requested = set(plots)
+    unknown = requested - {"trace", "input", "output", "input-output"}
+    if unknown:
+        raise ValueError(f"Unknown benchmark plots: {sorted(unknown)}")
+
+    created: list[Path] = []
+    if "trace" in requested:
+        trace_path = output_dir / f"{prefix}.trace.png"
+        generate_trace_plot(
+            arrival_times=list(result.get("arrival_times", [])),
+            start_times=list(result.get("start_times", [])),
+            latencies=list(result.get("latencies", [])),
+            successes=list(result.get("successes", [])),
+            output_path=trace_path,
+        )
+        created.append(trace_path)
+
+    input_lens = [int(value) for value in result.get("input_lens", [])]
+    output_lens = [int(value) for value in result.get("output_lens", [])]
+    if "input" in requested:
+        input_path = output_dir / f"{prefix}.input_distribution.png"
+        generate_length_distribution_plot(
+            input_lens,
+            input_path,
+            title="Input Length Distribution",
+            xlabel="Input tokens",
+            color="#2563EB",
+        )
+        created.append(input_path)
+    if "output" in requested:
+        output_path = output_dir / f"{prefix}.output_distribution.png"
+        generate_length_distribution_plot(
+            output_lens,
+            output_path,
+            title="Output Length Distribution",
+            xlabel="Actually generated output tokens",
+            color="#D97706",
+        )
+        created.append(output_path)
+    if "input-output" in requested:
+        joint_path = output_dir / f"{prefix}.input_output_distribution.png"
+        generate_input_output_distribution_plot(
+            input_lens=input_lens,
+            output_lens=output_lens,
+            output_path=joint_path,
+        )
+        created.append(joint_path)
+
+    return created
 
 
 def generate_dataset_stats_plot(
@@ -439,6 +632,9 @@ def generate_dataset_stats_plot(
             - output_tokens: Number of output tokens
         output_path: Path where the figure will be saved
     """
+    if plt is None:
+        raise ImportError("Dataset statistics plotting requires Matplotlib.")
+
     # Extract data
     prompt_tokens = []
     output_tokens = []
@@ -509,3 +705,64 @@ def generate_dataset_stats_plot(
     plt.close(fig)
 
     print(f"Dataset statistics plot saved to: {output_path}")
+
+
+def generate_benchmark_plots_from_file(
+    result_json: Path,
+    output_dir: Path | None = None,
+    prefix: str | None = None,
+    plots: Sequence[str] = ("trace", "input", "output", "input-output"),
+) -> list[Path]:
+    """Generate plots independently from a saved detailed benchmark result."""
+    with result_json.open(encoding="utf-8") as file:
+        result = json.load(file)
+    if not isinstance(result, dict):
+        raise ValueError("Benchmark result JSON must contain one object.")
+
+    return generate_benchmark_plots(
+        result=result,
+        output_dir=output_dir or result_json.parent,
+        prefix=prefix or result_json.stem,
+        plots=plots,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate static plots from one detailed benchmark result."
+    )
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        required=True,
+        help="Detailed benchmark result JSON generated by vllm bench serve.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Output directory. Defaults to the result JSON directory.",
+    )
+    parser.add_argument(
+        "--prefix",
+        help="Output filename prefix. Defaults to the result JSON filename stem.",
+    )
+    parser.add_argument(
+        "--plots",
+        nargs="+",
+        choices=("trace", "input", "output", "input-output"),
+        default=("trace", "input", "output", "input-output"),
+        help="Plots to generate. Defaults to all four plots.",
+    )
+    args = parser.parse_args()
+    created = generate_benchmark_plots_from_file(
+        result_json=args.result_json,
+        output_dir=args.output_dir,
+        prefix=args.prefix,
+        plots=args.plots,
+    )
+    for path in created:
+        print(path)
+
+
+if __name__ == "__main__":
+    main()
