@@ -344,25 +344,21 @@ def generate_trace_plot(
         gridspec_kw={"height_ratios": [1.1, 1]},
     )
 
+    # Draw scheduled arrivals last with a white halo so they remain visible
+    # when the observed starts follow the schedule exactly.
     series = [
-        ("Scheduled arrivals", "scheduled", "--"),
         ("Observed starts", "observed", "-"),
         ("Successful completions", "completion", ":"),
+        ("Scheduled arrivals", "scheduled", "--"),
     ]
     colors = {
         "scheduled": "#6B7280",
         "observed": "#2563EB",
         "completion": "#D97706",
     }
+    rate_handles = {}
     for label, key, line_style in series:
-        rate_ax.plot(
-            data["bucket_centers"],
-            data[f"{key}_rates"],
-            label=label,
-            color=colors[key],
-            linestyle=line_style,
-            linewidth=1.8,
-        )
+        rate_values = data[f"{key}_rates"]
         timestamps = data[
             {
                 "scheduled": "scheduled_arrivals",
@@ -370,20 +366,64 @@ def generate_trace_plot(
                 "completion": "completion_times",
             }[key]
         ]
+        cumulative_values = range(1, len(timestamps) + 1)
+        zorder = 5 if key == "scheduled" else 3
+
+        if key == "scheduled":
+            rate_ax.plot(
+                data["bucket_centers"],
+                rate_values,
+                color="white",
+                linestyle=line_style,
+                linewidth=4.2,
+                zorder=zorder - 1,
+            )
+            cumulative_ax.step(
+                timestamps,
+                cumulative_values,
+                where="post",
+                color="white",
+                linestyle=line_style,
+                linewidth=4.2,
+                zorder=zorder - 1,
+            )
+
+        (rate_line,) = rate_ax.plot(
+            data["bucket_centers"],
+            rate_values,
+            label=label,
+            color=colors[key],
+            linestyle=line_style,
+            linewidth=2.2 if key == "scheduled" else 1.8,
+            zorder=zorder,
+        )
+        rate_handles[label] = rate_line
         cumulative_ax.step(
             timestamps,
-            range(1, len(timestamps) + 1),
+            cumulative_values,
             where="post",
             color=colors[key],
             linestyle=line_style,
-            linewidth=1.8,
+            linewidth=2.2 if key == "scheduled" else 1.8,
+            zorder=zorder,
         )
 
     rate_ax.set_title(
         f"Request Rate ({data['bin_width']:g}s buckets)", loc="left", fontsize=12
     )
     rate_ax.set_ylabel("Requests / second")
-    rate_ax.legend(loc="upper right", ncols=3, frameon=False)
+    legend_labels = [
+        "Scheduled arrivals",
+        "Observed starts",
+        "Successful completions",
+    ]
+    rate_ax.legend(
+        [rate_handles[label] for label in legend_labels],
+        legend_labels,
+        loc="upper right",
+        ncols=3,
+        frameon=False,
+    )
     rate_ax.grid(True, color="#D1D5DB", alpha=0.55, linewidth=0.8)
     rate_ax.set_ylim(bottom=0)
 
@@ -396,11 +436,19 @@ def generate_trace_plot(
     fig.suptitle(
         "Scheduled vs Observed Benchmark Trace",
         x=0.07,
+        y=0.985,
         ha="left",
         fontsize=15,
         fontweight="bold",
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.text(
+        0.07,
+        0.945,
+        "Scheduled is drawn on top; overlap with observed means on-time dispatch.",
+        color="#4B5563",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(output_path, dpi=160, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Request trace plot saved to: {output_path}")
