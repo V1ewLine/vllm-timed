@@ -82,6 +82,13 @@ if [[ ! -f "${TRACE}" ]]; then
   exit 1
 fi
 
+if ! uv run --active python -c "import matplotlib" >/dev/null 2>&1; then
+  echo "ERROR: Matplotlib is required to generate benchmark plots."
+  echo "Install it into the active vLLM environment, then rerun:"
+  echo "  uv pip install --python ${VIRTUAL_ENV}/bin/python matplotlib"
+  exit 2
+fi
+
 mkdir -p "${RESULT_DIR}"
 
 TRACE_NUM_PROMPTS="$(grep -cve '^[[:space:]]*$' "${TRACE}")"
@@ -130,7 +137,7 @@ TRACE_IDLE_GAP_THRESHOLD="${TIMED_TRACE_IDLE_GAP_THRESHOLD}" \
 TRACE_IDLE_SEC_MULTIPLIER="${TIMED_TRACE_IDLE_SEC_MULTIPLIER}" \
 TRACE_NUM_PROMPTS="${NUM_PROMPTS}" \
 MAX_MODEL_LEN_FOR_CHECK="${MAX_MODEL_LEN}" \
-uv run python - <<'PY'
+uv run --active python - <<'PY'
 import json
 import math
 import os
@@ -339,7 +346,7 @@ rm -f "${SERVER_LOG}"
 # shellcheck disable=SC2086
   # --enable-chunked-prefill \
   # --enable-expert-parallel
-uv run vllm serve "${MODEL}" \
+uv run --active vllm serve "${MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --host "${HOST}" \
   --port "${PORT}" \
@@ -437,7 +444,7 @@ echo "BENCH_LOG=${BENCH_LOG}"
 
 set +e
 # shellcheck disable=SC2086
-uv run vllm bench serve \
+uv run --active vllm bench serve \
   --backend "${BACKEND}" \
   --base-url "${BASE_URL}" \
   --endpoint "${ENDPOINT}" \
